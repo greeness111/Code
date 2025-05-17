@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import struct
+import threading
 
 DIR_REQUEST = 'REQUEST'
 TYPE_FILE, TYPE_DATA, TYPE_AUTH = 'FILE', 'DATA', 'AUTH'
@@ -12,12 +13,15 @@ FIELD_OPERATION, FIELD_DIRECTION, FIELD_TYPE, FIELD_USERNAME, FIELD_PASSWORD, FI
 FIELD_KEY, FIELD_SIZE, FIELD_TOTAL_BLOCK, FIELD_MD5, FIELD_BLOCK_SIZE = 'key', 'size', 'total_block', 'md5', 'block_size'
 FIELD_STATUS, FIELD_STATUS_MSG, FIELD_BLOCK_INDEX = 'status', 'status_msg', 'block_index'
 
+PARALLELISM = 256
 PACKET_LENGTH = 20480
 RE_TRANSMISSION_TIME = 15
 TOTAL_BLOCK = 0
+SEMAPHORE = threading.Semaphore(PARALLELISM)
 STUDENT_ID, TOKEN = None, None
 SERVER_IP, SERVER_PORT = None, 1379
 FILE_PATH, FILE_NAME, FILE_SIZE = '', '', 0
+SEND_LOCK = threading.Lock()
 
 FAST_TEST_MODE_FOR_CAN201 = True
 
@@ -114,16 +118,33 @@ def step_upload_operation(block_index):
             full_packet = step_head + block_data
             client_socket = socket_setup()
 
+            # WAIT ATOMIC LOCK
+            SEND_LOCK.acquire()
+            # START ATOMIC OPERATION
+
             client_socket.send(full_packet)
             client_socket.settimeout(RE_TRANSMISSION_TIME)
             try:
                 json_data, _ = get_step_data(client_socket)
+
+                # RELEASE ATOMIC LOCK
+                SEND_LOCK.release()
+                # END ATOMIC OPERATION
+
                 if get_status_code(json_data) != 200:
                     print(json_data)
             except socket.timeout:
-                print(f"Re Transmission {block_index}")
+                print(f"Re Transmission{block_index}")
                 step_upload_operation(block_index)
             client_socket.close()
+
+
+def concurrent_uploader(block_index):
+    step_upload_operation(block_index)
+
+    # END CONCURRENT UPLOADER
+    SEMAPHORE.release()
+    # SIGNAL SCHEDULER
 
 
 def main():
@@ -132,13 +153,26 @@ def main():
 
     FILE_NAME = os.path.basename(FILE_PATH)
     FILE_SIZE = os.path.getsize(FILE_PATH)
+    threads = []
+    total_threads = (FILE_SIZE + PACKET_LENGTH - 1) // PACKET_LENGTH
 
     step_login_operation(STUDENT_ID)
     step_save_operation(FILE_NAME, FILE_SIZE)
-    RE_TRANSMISSION_TIME = RE_TRANSMISSION_TIME + (FILE_SIZE // PACKET_LENGTH)
+    RE_TRANSMISSION_TIME = RE_TRANSMISSION_TIME + (total_threads // 1000)
 
-    for i in range((FILE_SIZE + PACKET_LENGTH - 1) // PACKET_LENGTH):
-        step_upload_operation(i)
+    for i in range(total_threads):
+
+        # WAIT SCHEDULER
+        SEMAPHORE.acquire()
+        # START CONCURRENT UPLOADER
+
+        thread = threading.Thread(target=concurrent_uploader, args=(i,))
+        threads.append(thread)
+        thread.start()
+
+    if not FAST_TEST_MODE_FOR_CAN201:
+        for thread in threads:
+            thread.join()
 
 
 if __name__ == '__main__':
